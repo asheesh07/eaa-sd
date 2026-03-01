@@ -102,16 +102,55 @@ class TargetModel:
         return outputs.logits[:, -1, :]
     
     def rollback_cache(self, n_tokens: int):
-        """Truncate KV cache by n positions."""
+        """Truncate KV cache by n positions. Handles both DynamicCache and tuple formats."""
         if self._past_key_values is None or n_tokens <= 0:
             return
         
-        new_past = []
-        for layer_past in self._past_key_values:
-            truncated = tuple(t[:, :, :-n_tokens, :] for t in layer_past)
-            new_past.append(truncated)
+        try:
+            # Modern transformers (>=4.36) uses DynamicCache object
+            from transformers.cache_utils import DynamicCache
+            if isinstance(self._past_key_values, DynamicCache):
+                new_cache = DynamicCache()
+                for layer_idx in range(len(self._past_key_values)):
+                    key = self._past_key_values.key_cache[layer_idx]
+                    value = self._past_key_values.value_cache[layer_idx]
+                    if key is not None and key.shape[2] > n_tokens:
+                        new_cache.update(
+                            key[:, :, :-n_tokens, :],
+                            value[:, :, :-n_tokens, :],
+                            layer_idx
+                        )
+                    elif key is not None:
+                        # Would truncate everything — just clear
+                        new_cache.update(
+                            key[:, :, :0, :],
+                            value[:, :, :0, :],
+                            layer_idx
+                        )
+                self._past_key_values = new_cache
+                self._cache_seq_len -= n_tokens
+                return
+        except (ImportError, AttributeError):
+            pass
         
-        self._past_key_values = tuple(new_past)
+        # Legacy tuple format
+        if isinstance(self._past_key_values, (tuple, list)):
+            new_past = []
+            for layer_past in self._past_key_values:
+                if layer_past is None:
+                    new_past.append(None)
+                    continue
+                truncated_layer = []
+                for t in layer_past:
+                    if t is None:
+                        truncated_layer.append(None)
+                    elif t.dim() >= 3 and t.shape[2] > n_tokens:
+                        truncated_layer.append(t[:, :, :-n_tokens, :])
+                    else:
+                        truncated_layer.append(t)
+                new_past.append(tuple(truncated_layer))
+            self._past_key_values = tuple(new_past)
+        
         self._cache_seq_len -= n_tokens
     
     # ──────────────────────────────────────────────
@@ -205,16 +244,17 @@ class TargetModel:
         # Compute JS divergences for each position
         js_divergences = []
         for i in range(K):
-            d_logits = draft_logits[i].to(self.device)
-            t_logits = target_logits_all[i] if i < K else target_logits_all[-1]
+            d_logits = draft_logits[i].to(self.device).float().clamp(-100, 100)
+            t_logits = target_logits_all[i].float().clamp(-100, 100)
             
             # Simplified JSD computation
-            p = F.softmax(d_logits / max(self.gen_config.temperature, 1e-8), dim=-1)
-            q = F.softmax(t_logits / max(self.gen_config.temperature, 1e-8), dim=-1)
-            m = 0.5 * (p + q)
-            jsd = 0.5 * (F.kl_div(m.log(), p, reduction='sum') +
-                         F.kl_div(m.log(), q, reduction='sum'))
-            js_divergences.append(max(0.0, jsd.item()))
+            p = F.softmax(d_logits / max(self.gen_config.temperature, 1e-8), dim=-1).clamp(min=1e-10)
+            q = F.softmax(t_logits / max(self.gen_config.temperature, 1e-8), dim=-1).clamp(min=1e-10)
+            m = (0.5 * (p + q)).clamp(min=1e-10)
+            jsd = 0.5 * (F.kl_div(m.log(), p, reduction='sum', log_target=False) +
+                         F.kl_div(m.log(), q, reduction='sum', log_target=False))
+            jsd_val = jsd.item() if torch.isfinite(jsd) else 0.0
+            js_divergences.append(max(0.0, jsd_val))
         
         # Now do the speculative sampling acceptance/rejection
         accepted_tokens = []
@@ -231,17 +271,17 @@ class TargetModel:
             # This is handled by the engine passing pre_logits separately.
             # Here we process using the logits the engine has assembled.
             
-            d_logits = draft_logits[i].to(self.device)
+            d_logits = draft_logits[i].to(self.device).float()
             
             # We verify draft[i] using target logits at position i
             # (the engine will assemble these correctly)
-            t_logits = target_logits_all[min(i, K-1)]
+            t_logits = target_logits_all[min(i, K-1)].float()
             
             draft_token = draft_token_ids[i]
             
             # Compute acceptance probability
-            p_draft = F.softmax(d_logits / max(temp, 1e-8), dim=-1)
-            p_target = F.softmax(t_logits / max(temp, 1e-8), dim=-1)
+            p_draft = F.softmax(d_logits / max(temp, 1e-8), dim=-1).clamp(min=1e-10)
+            p_target = F.softmax(t_logits / max(temp, 1e-8), dim=-1).clamp(min=1e-10)
             
             # Speculative sampling criterion
             acceptance_prob = torch.clamp(

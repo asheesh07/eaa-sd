@@ -155,7 +155,10 @@ class DraftModel:
         tp = top_p or self.gen_config.top_p
         tk = top_k or self.gen_config.top_k
         
-        logits = logits.squeeze(0).float()  # [vocab_size]
+        logits = logits.squeeze(0).float()  # [vocab_size] — MUST be float32
+        
+        # Clamp to prevent overflow
+        logits = torch.clamp(logits, min=-100.0, max=100.0)
         
         if not self.gen_config.do_sample:
             # Greedy
@@ -231,20 +234,54 @@ class DraftModel:
         """
         Roll back the KV cache by n_tokens.
         Used when verification rejects some drafted tokens.
-        
-        This is done by truncating the cached key-value tensors.
+        Handles both DynamicCache and legacy tuple format.
         """
         if self._past_key_values is None or n_tokens <= 0:
             return
         
-        new_past = []
-        for layer_past in self._past_key_values:
-            # Each layer_past is a tuple of (key, value)
-            # Shape: [batch, num_heads, seq_len, head_dim]
-            truncated = tuple(t[:, :, :-n_tokens, :] for t in layer_past)
-            new_past.append(truncated)
+        try:
+            from transformers.cache_utils import DynamicCache
+            if isinstance(self._past_key_values, DynamicCache):
+                new_cache = DynamicCache()
+                for layer_idx in range(len(self._past_key_values)):
+                    key = self._past_key_values.key_cache[layer_idx]
+                    value = self._past_key_values.value_cache[layer_idx]
+                    if key is not None and key.shape[2] > n_tokens:
+                        new_cache.update(
+                            key[:, :, :-n_tokens, :],
+                            value[:, :, :-n_tokens, :],
+                            layer_idx
+                        )
+                    elif key is not None:
+                        new_cache.update(
+                            key[:, :, :0, :],
+                            value[:, :, :0, :],
+                            layer_idx
+                        )
+                self._past_key_values = new_cache
+                self._cache_seq_len -= n_tokens
+                return
+        except (ImportError, AttributeError):
+            pass
         
-        self._past_key_values = tuple(new_past)
+        # Legacy tuple format
+        if isinstance(self._past_key_values, (tuple, list)):
+            new_past = []
+            for layer_past in self._past_key_values:
+                if layer_past is None:
+                    new_past.append(None)
+                    continue
+                truncated_layer = []
+                for t in layer_past:
+                    if t is None:
+                        truncated_layer.append(None)
+                    elif t.dim() >= 3 and t.shape[2] > n_tokens:
+                        truncated_layer.append(t[:, :, :-n_tokens, :])
+                    else:
+                        truncated_layer.append(t)
+                new_past.append(tuple(truncated_layer))
+            self._past_key_values = tuple(new_past)
+        
         self._cache_seq_len -= n_tokens
     
     @property

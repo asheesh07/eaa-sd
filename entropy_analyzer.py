@@ -75,8 +75,14 @@ class EntropyAnalyzer:
         Returns:
             Entropy scalar (bits)
         """
+        # CRITICAL: cast to float32 — fp16/bf16/quantized logits cause NaN in softmax
+        logits = logits.detach().float()
+        
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
+        
+        # Clamp to prevent overflow before softmax
+        logits = torch.clamp(logits, min=-100.0, max=100.0)
         
         # Apply temperature
         scaled_logits = logits / max(temperature, 1e-8)
@@ -84,9 +90,15 @@ class EntropyAnalyzer:
         # Convert to probabilities
         probs = F.softmax(scaled_logits, dim=-1)
         
-        # Shannon entropy: H = -Σ p*log(p), avoiding log(0)
-        log_probs = torch.log(probs + 1e-10)
+        # Clamp probs to avoid log(0)
+        probs = torch.clamp(probs, min=1e-10, max=1.0)
+        
+        # Shannon entropy: H = -Σ p*log(p)
+        log_probs = torch.log(probs)
         entropy = -(probs * log_probs).sum(dim=-1)
+        
+        # Safety: replace any remaining NaN/Inf with a default mid-entropy value
+        entropy = torch.where(torch.isfinite(entropy), entropy, torch.tensor(2.0))
         
         return entropy.squeeze()
     
@@ -103,18 +115,26 @@ class EntropyAnalyzer:
         This is symmetric and bounded [0, ln(2)].
         Used for adaptive acceptance thresholds (AdaSD-style).
         """
-        p = F.softmax(p_logits / max(temperature, 1e-8), dim=-1)
-        q = F.softmax(q_logits / max(temperature, 1e-8), dim=-1)
+        # CRITICAL: cast to float32
+        p_logits = p_logits.detach().float().clamp(-100, 100)
+        q_logits = q_logits.detach().float().clamp(-100, 100)
+        
+        p = F.softmax(p_logits / max(temperature, 1e-8), dim=-1).clamp(min=1e-10)
+        q = F.softmax(q_logits / max(temperature, 1e-8), dim=-1).clamp(min=1e-10)
         
         # Mixture distribution
-        m = 0.5 * (p + q)
+        m = (0.5 * (p + q)).clamp(min=1e-10)
         
-        # KL divergences
-        kl_pm = F.kl_div(m.log(), p, reduction='sum')
-        kl_qm = F.kl_div(m.log(), q, reduction='sum')
+        # KL divergences — use log_target form for numerical stability
+        kl_pm = F.kl_div(m.log(), p, reduction='sum', log_target=False)
+        kl_qm = F.kl_div(m.log(), q, reduction='sum', log_target=False)
         
         jsd = 0.5 * (kl_pm + kl_qm)
-        return jsd.clamp(min=0.0)  # numerical safety
+        
+        # Safety
+        if not torch.isfinite(jsd):
+            return torch.tensor(0.0)
+        return jsd.clamp(min=0.0)
     
     @staticmethod
     def compute_top_n_overlap(
