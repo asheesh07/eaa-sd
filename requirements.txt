@@ -6,4 +6,4 @@ sentencepiece>=0.1.99
 protobuf>=3.20.0
 scipy>=1.11.0
 termcolor>=2.3.0
-optimum-quantom
+optimum-quantom >=1.0.0
