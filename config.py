@@ -12,8 +12,8 @@ import torch
 @dataclass
 class ModelConfig:
     """Model identifiers and loading settings."""
-    draft_model_name: str = "meta-llama/Llama-3.2-1B-Instruct"
-    target_model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    draft_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    target_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     
     # Device placement
     draft_device: str = "cuda:0"
