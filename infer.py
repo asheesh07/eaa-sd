@@ -229,16 +229,11 @@ class InferenceCLI:
 
     def _run(self):
 
-        while True:
-            command = input("> ").replace("\\n", "\n").replace("\\t", "\t")
+        prompt = "Explain entropy in simple terms."
+        print(colored("Running fixed prompt:", "cyan"))
+        print(prompt)
 
-            if command.startswith("/"):
-                if command == "/quit":
-                    print(colored("Goodbye!", on_color="on_red"))
-                    exit(0)
-                continue
-
-            self._infer(command)
+        self._infer(prompt)
 
     # ---------------------------------------------------
     # Seed Control
