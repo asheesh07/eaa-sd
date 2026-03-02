@@ -1,17 +1,13 @@
 """
-Draft Generation Loop — Adaptive Entropy-Aware Drafting
-=========================================================
-The inner loop that generates K candidate tokens from the draft model,
-dynamically stopping based on entropy signals.
+Draft Generation Loop — Adaptive Entropy-Aware Drafting (v3)
+=============================================================
+Generates K candidate tokens from the draft model, dynamically
+stopping based on entropy signals.
 
-This is where the "adaptive K" magic happens:
-- Start generating tokens from the draft model
-- At each step, compute entropy
-- If entropy is low → keep going (model is confident)
-- If entropy spikes or crosses threshold → STOP and hand off to verifier
-
-The loop produces a "draft sequence" that gets batch-verified
-by the target model in a single forward pass.
+v3 fixes:
+- should_stop_drafting only handles early stopping, not the K limit
+- stopped_by correctly classified
+- k_min guard is in entropy_analyzer, not duplicated here
 """
 
 import torch
@@ -21,122 +17,78 @@ from entropy_analyzer import EntropyAnalyzer
 
 
 class DraftSequence(NamedTuple):
-    """Complete output of a draft generation round."""
-    token_ids: List[int]                # K draft token IDs
-    logits: List[torch.Tensor]          # K logit vectors [vocab_size]
-    entropies: List[float]              # K entropy values
-    log_probs: List[float]              # K log probabilities
-    stopped_by: str                     # Why we stopped: "k_limit", "entropy_high", 
-                                        # "entropy_spike", "cumulative", "eos"
+    token_ids: List[int]
+    logits: List[torch.Tensor]
+    entropies: List[float]
+    log_probs: List[float]
+    stopped_by: str  # "k_limit", "entropy_high", "entropy_spike", "cumulative", "eos"
 
 
 class DraftLoop:
-    """
-    The adaptive draft generation loop.
     
-    Flow for each round:
-    ┌─────────────┐
-    │ Get current K│ ← from EntropyAnalyzer
-    └──────┬──────┘
-           ▼
-    ┌─────────────────────────────────────────┐
-    │ FOR i = 0 to K-1:                       │
-    │   1. Draft model generates next token   │
-    │   2. Compute entropy H(p_draft)         │
-    │   3. Check stopping conditions:         │
-    │      - H > threshold? → STOP            │
-    │      - H spiked? → STOP                 │
-    │      - Cumulative H budget? → STOP      │
-    │   4. If not stopped, continue           │
-    └──────┬──────────────────────────────────┘
-           ▼
-    ┌─────────────────────────────────────────┐
-    │ Return DraftSequence (tokens + logits)  │
-    │ → handed to target model for verify     │
-    └─────────────────────────────────────────┘
-    """
-    
-    def __init__(
-        self,
-        draft_model: DraftModel,
-        entropy_analyzer: EntropyAnalyzer,
-        config
-    ):
+    def __init__(self, draft_model, entropy_analyzer, config):
         self.draft_model = draft_model
         self.entropy_analyzer = entropy_analyzer
         self.config = config
         self.gen_config = config.generation
         self.verbose = config.verbose
     
-    def generate_draft(
-        self,
-        last_token_id: int,
-    ) -> DraftSequence:
+    def generate_draft(self, last_token_id: int) -> DraftSequence:
         """
-        Generate a sequence of draft tokens with adaptive stopping.
+        Generate draft tokens with adaptive stopping.
         
-        This is the main draft loop. It:
-        1. Gets the current adaptive K from the entropy analyzer
-        2. Generates tokens one-by-one from the draft model
-        3. Monitors entropy at each step
-        4. Stops early if entropy signals suggest uncertainty
-        
-        Args:
-            last_token_id: The last confirmed token (accepted or correction)
-            
-        Returns:
-            DraftSequence containing all drafted tokens and metadata
+        The loop runs for up to current_k steps. At each step AFTER generating
+        the token, we ask the entropy analyzer if we should stop early.
+        The analyzer handles all the logic about k_min, entropy thresholds, etc.
         """
         token_ids = []
         logits_list = []
         entropies = []
         log_probs = []
-        stopped_by = "k_limit"
+        stopped_by = "k_limit"  # Default: we ran the full K
         
-        # Current adaptive K
         current_k = self.entropy_analyzer.state.current_k
         
-        # Track the token to feed into next step
-        current_token = torch.tensor(
-            [[last_token_id]], dtype=torch.long
-        )
+        current_token = torch.tensor([[last_token_id]], dtype=torch.long)
         
         for step in range(current_k):
-            # ── Step 1: Generate one draft token ──
+            # Step 1: Generate one draft token
             draft_output = self.draft_model.draft_one(current_token)
             
-            # ── Step 2: Record outputs ──
+            # Step 2: Record
             token_ids.append(draft_output.token_id)
-            logits_list.append(draft_output.logits.cpu())  # Store on CPU to save VRAM
+            logits_list.append(draft_output.logits.cpu())
             entropies.append(draft_output.entropy)
             log_probs.append(draft_output.log_prob)
             
-            # ── Step 3: Check EOS ──
+            # Step 3: Check EOS
             if draft_output.token_id == self.gen_config.eos_token_id:
                 stopped_by = "eos"
                 break
             
-            # ── Step 4: Entropy-based stopping ──
+            # Step 4: Ask entropy analyzer about early stopping
+            # This only returns True for EARLY stopping (before reaching K).
+            # It respects k_min internally and won't stop before enough tokens.
             should_stop = self.entropy_analyzer.should_stop_drafting(
                 current_entropy=draft_output.entropy,
                 draft_position=step,
                 entropy_sequence=entropies
             )
             
-            if should_stop and step + 1 >= self.entropy_analyzer.config.k_min:
-                # Only stop early if we've met the minimum K
-                if draft_output.entropy > self.entropy_analyzer.config.entropy_high:
+            if should_stop:
+                # Classify the stop reason
+                cfg = self.entropy_analyzer.config
+                if draft_output.entropy > cfg.entropy_high:
                     stopped_by = "entropy_high"
-                elif len(entropies) >= 2 and entropies[-1] / max(entropies[-2], 0.01) > self.entropy_analyzer.config.entropy_spike_ratio:
+                elif (len(entropies) >= 2 and 
+                      (entropies[-1] - entropies[-2]) > cfg.entropy_spike_ratio):
                     stopped_by = "entropy_spike"
                 else:
                     stopped_by = "cumulative"
                 break
             
-            # ── Step 5: Prepare for next step ──
-            current_token = torch.tensor(
-                [[draft_output.token_id]], dtype=torch.long
-            )
+            # Step 5: Prepare next
+            current_token = torch.tensor([[draft_output.token_id]], dtype=torch.long)
         
         if self.verbose:
             avg_entropy = sum(entropies) / max(len(entropies), 1)
@@ -155,27 +107,17 @@ class DraftLoop:
             stopped_by=stopped_by
         )
     
-    def generate_draft_greedy(
-        self,
-        last_token_id: int,
-        fixed_k: int
-    ) -> DraftSequence:
-        """
-        Generate a fixed-K draft sequence WITHOUT adaptive stopping.
-        Used for benchmarking / ablation against the adaptive version.
-        """
+    def generate_draft_greedy(self, last_token_id: int, fixed_k: int) -> DraftSequence:
+        """Fixed-K draft without adaptive stopping. For benchmarking."""
         token_ids = []
         logits_list = []
         entropies = []
         log_probs = []
         
-        current_token = torch.tensor(
-            [[last_token_id]], dtype=torch.long
-        )
+        current_token = torch.tensor([[last_token_id]], dtype=torch.long)
         
         for _ in range(fixed_k):
             draft_output = self.draft_model.draft_one(current_token)
-            
             token_ids.append(draft_output.token_id)
             logits_list.append(draft_output.logits.cpu())
             entropies.append(draft_output.entropy)
@@ -183,10 +125,7 @@ class DraftLoop:
             
             if draft_output.token_id == self.gen_config.eos_token_id:
                 break
-            
-            current_token = torch.tensor(
-                [[draft_output.token_id]], dtype=torch.long
-            )
+            current_token = torch.tensor([[draft_output.token_id]], dtype=torch.long)
         
         return DraftSequence(
             token_ids=token_ids,

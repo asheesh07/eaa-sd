@@ -1,376 +1,264 @@
 """
-Entropy Analyzer — Adaptive K Decision Engine
-===============================================
-The core intelligence of the system. Computes token-level entropy,
-tracks entropy trajectories, and decides when to stop drafting.
+Entropy Analyzer v3 — Adaptive K Decision Engine
+==================================================
+Fixes the K-collapse death spiral from v1/v2.
 
-Key ideas drawn from:
-- EASD (arxiv 2512.23765): entropy-aware rejection with dual-model entropy
-- AdaSD (arxiv 2512.11280): adaptive thresholds via entropy + JS divergence
-- HeteroSpec: cumulative entropy for context predictability estimation
+Root causes of K=1 trap:
+1. should_stop_drafting condition 1 fires at step=0 when K=1 → always stops at 1 token
+2. compute_adaptive_k requires acc_rate > target+0.05 to increase, but at K=1
+   with a misaligned pair, acceptance EMA hovers 0.3-0.5 → never exceeds threshold
+3. Asymmetric step sizes (decrease by 2, increase by 1) in v1
+4. Entropy thresholds calibrated for char-level models, not 32K-vocab LLMs
+5. stopped_by="cumulative" fires on 1 token because cumulative check has no min length
+
+v3 fixes:
+- K floor: if K hits k_min, FORCE increase after N rounds regardless of acceptance
+- Warmup: K stays at k_initial for first 5 rounds (enough signal to judge)
+- Symmetric ±1 steps with bias toward increasing
+- Entropy thresholds calibrated for 32K vocab (max ~10.3 nats)
+- should_stop_drafting CANNOT fire before generating k_min tokens
+- Recovery mechanism: track consecutive rounds at k_min and force bump
 """
 
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Optional
 import math
 
 
 @dataclass
 class EntropyState:
-    """Tracks entropy statistics across the decoding session."""
     entropy_history: List[float] = field(default_factory=list)
     acceptance_history: List[float] = field(default_factory=list)
     k_history: List[int] = field(default_factory=list)
-    
-    # EMA trackers
-    ema_entropy: float = 1.0
-    ema_acceptance_rate: float = 0.8
-    ema_js_threshold: float = 0.1
-    
-    # Current adaptive K
+    ema_entropy: float = 3.0
+    ema_acceptance_rate: float = 0.5   # Start neutral, not optimistic
+    ema_js_threshold: float = 0.15
     current_k: int = 5
-    
-    # Stats
     total_draft_tokens: int = 0
     total_accepted_tokens: int = 0
     total_verification_rounds: int = 0
+    consecutive_at_k_min: int = 0       # Track how long we've been stuck at floor
 
 
 class EntropyAnalyzer:
-    """
-    Computes entropy metrics and makes adaptive K decisions.
-    
-    The entropy of a probability distribution p is:
-        H(p) = -Σ p(x) * log(p(x))
-    
-    Low entropy = model is confident (peaked distribution)
-    High entropy = model is uncertain (flat distribution)
-    
-    We use this to:
-    1. Decide how many tokens to draft (adaptive K)
-    2. Decide whether to accept/reject during verification (EASD penalty)
-    3. Track session-level statistics for online adaptation
-    """
     
     def __init__(self, config):
         self.config = config.entropy
         self.gen_config = config.generation
         self.state = EntropyState(current_k=config.entropy.k_initial)
+        self._warmup_rounds = 5
     
     # ──────────────────────────────────────────────
-    #  CORE ENTROPY COMPUTATIONS
+    #  CORE COMPUTATIONS  
     # ──────────────────────────────────────────────
     
     @staticmethod
     def compute_entropy(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-        """
-        Compute Shannon entropy from logits.
-        
-        Args:
-            logits: Raw logits [batch, vocab_size] or [vocab_size]
-            temperature: Sampling temperature (applied before softmax)
-        
-        Returns:
-            Entropy scalar (bits)
-        """
-        # CRITICAL: cast to float32 — fp16/bf16/quantized logits cause NaN in softmax
         logits = logits.detach().float()
-        
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
-        
-        # Clamp to prevent overflow before softmax
         logits = torch.clamp(logits, min=-100.0, max=100.0)
-        
-        # Apply temperature
-        scaled_logits = logits / max(temperature, 1e-8)
-        
-        # Convert to probabilities
-        probs = F.softmax(scaled_logits, dim=-1)
-        
-        # Clamp probs to avoid log(0)
-        probs = torch.clamp(probs, min=1e-10, max=1.0)
-        
-        # Shannon entropy: H = -Σ p*log(p)
-        log_probs = torch.log(probs)
+        scaled = logits / max(temperature, 1e-8)
+        log_probs = F.log_softmax(scaled, dim=-1)
+        probs = log_probs.exp()
         entropy = -(probs * log_probs).sum(dim=-1)
-        
-        # Safety: replace any remaining NaN/Inf with a default mid-entropy value
-        entropy = torch.where(torch.isfinite(entropy), entropy, torch.tensor(2.0))
-        
+        entropy = torch.where(torch.isfinite(entropy), entropy, torch.tensor(3.0))
         return entropy.squeeze()
     
     @staticmethod
-    def compute_js_divergence(
-        p_logits: torch.Tensor,
-        q_logits: torch.Tensor,
-        temperature: float = 1.0
-    ) -> torch.Tensor:
-        """
-        Jensen-Shannon divergence between two distributions.
-        JSD(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M) where M = 0.5*(P+Q)
-        
-        This is symmetric and bounded [0, ln(2)].
-        Used for adaptive acceptance thresholds (AdaSD-style).
-        """
-        # CRITICAL: cast to float32
+    def compute_js_divergence(p_logits, q_logits, temperature=1.0):
         p_logits = p_logits.detach().float().clamp(-100, 100)
         q_logits = q_logits.detach().float().clamp(-100, 100)
-        
-        p = F.softmax(p_logits / max(temperature, 1e-8), dim=-1).clamp(min=1e-10)
-        q = F.softmax(q_logits / max(temperature, 1e-8), dim=-1).clamp(min=1e-10)
-        
-        # Mixture distribution
+        p_log = F.log_softmax(p_logits / max(temperature, 1e-8), dim=-1)
+        q_log = F.log_softmax(q_logits / max(temperature, 1e-8), dim=-1)
+        p, q = p_log.exp(), q_log.exp()
         m = (0.5 * (p + q)).clamp(min=1e-10)
-        
-        # KL divergences — use log_target form for numerical stability
-        kl_pm = F.kl_div(m.log(), p, reduction='sum', log_target=False)
-        kl_qm = F.kl_div(m.log(), q, reduction='sum', log_target=False)
-        
+        m_log = m.log()
+        kl_pm = (p * (p_log - m_log)).sum(dim=-1)
+        kl_qm = (q * (q_log - m_log)).sum(dim=-1)
         jsd = 0.5 * (kl_pm + kl_qm)
-        
-        # Safety
-        if not torch.isfinite(jsd):
+        if not torch.isfinite(jsd).all():
             return torch.tensor(0.0)
-        return jsd.clamp(min=0.0)
+        return jsd.clamp(min=0.0).squeeze()
     
     @staticmethod
-    def compute_top_n_overlap(
-        logits_a: torch.Tensor,
-        logits_b: torch.Tensor,
-        n: int = 5
-    ) -> float:
-        """
-        Fraction of overlap between top-N predictions of two models.
-        Used in EASD entropy penalty.
-        """
-        top_a = torch.topk(logits_a.squeeze(), n).indices
-        top_b = torch.topk(logits_b.squeeze(), n).indices
-        
-        # Set intersection
-        overlap = len(set(top_a.tolist()) & set(top_b.tolist()))
-        return overlap / n
+    def compute_top_n_overlap(logits_a, logits_b, n=5):
+        top_a = torch.topk(logits_a.detach().float().squeeze(), n).indices
+        top_b = torch.topk(logits_b.detach().float().squeeze(), n).indices
+        return len(set(top_a.tolist()) & set(top_b.tolist())) / n
     
     # ──────────────────────────────────────────────
-    #  ADAPTIVE K DECISIONS
+    #  ADAPTIVE K — EARLY STOPPING
     # ──────────────────────────────────────────────
     
-    def should_stop_drafting(
-        self,
-        current_entropy: float,
-        draft_position: int,
-        entropy_sequence: List[float]
-    ) -> bool:
+    def should_stop_drafting(self, current_entropy, draft_position, entropy_sequence):
         """
         Decide whether to stop the draft loop early.
         
-        Stopping conditions (any triggers halt):
-        1. Reached current adaptive K limit
-        2. Entropy exceeds high threshold (model is lost)
-        3. Entropy spike detected (sudden uncertainty jump)
-        4. Cumulative entropy exceeds budget
-        
-        Args:
-            current_entropy: Entropy of the token just generated
-            draft_position: How many tokens drafted so far (0-indexed)
-            entropy_sequence: All entropies in this draft round
-        
-        Returns:
-            True if drafting should stop
+        CRITICAL FIX: This can NEVER stop before k_min tokens are generated.
+        When K=1, should_stop_drafting should return False at position 0,
+        letting the loop complete naturally via the range(K) bound.
         """
         cfg = self.config
+        current_k = self.state.current_k
         
-        # Condition 1: Reached K limit
-        if draft_position + 1 >= self.state.current_k:
-            return True
+        # ── HARD RULE: Never stop before k_min tokens ──
+        # This is the primary fix for the K=1 trap.
+        # The loop range already limits to current_k tokens.
+        # This function should only trigger EARLY stopping WITHIN that range.
+        if draft_position + 1 < cfg.k_min:
+            return False
         
-        # Condition 2: Absolute entropy threshold
+        # ── Reached current K limit → let loop terminate naturally ──
+        # Don't return True here — the for-loop handles this.
+        # This function only decides whether to stop EARLY (before K).
+        if draft_position + 1 >= current_k:
+            return False  # Not "early" stopping — loop will end anyway
+        
+        # ── Below here: we've generated at least k_min tokens but < current_k ──
+        
+        # Only apply entropy-based stopping if we have enough tokens to judge
+        if draft_position < 2:
+            return False
+        
+        # Condition: Absolute entropy threshold — model is genuinely lost
         if current_entropy > cfg.entropy_high:
             return True
         
-        # Condition 3: Entropy spike detection
+        # Condition: Entropy spike — absolute jump 
         if len(entropy_sequence) >= 2:
-            prev_entropy = entropy_sequence[-2]
-            if prev_entropy > 0.01:  # avoid division by near-zero
-                spike_ratio = current_entropy / prev_entropy
-                if spike_ratio > cfg.entropy_spike_ratio:
-                    return True
+            delta = current_entropy - entropy_sequence[-2]
+            midpoint = (cfg.entropy_low + cfg.entropy_high) / 2
+            if delta > cfg.entropy_spike_ratio and current_entropy > midpoint:
+                return True
         
-        # Condition 4: Cumulative entropy budget
-        # If average entropy of drafted sequence is climbing, stop early
-        if len(entropy_sequence) >= 3:
-            recent_avg = sum(entropy_sequence[-3:]) / 3
-            if recent_avg > (cfg.entropy_low + cfg.entropy_high) / 2:
+        # Condition: Sustained high entropy over recent window
+        if len(entropy_sequence) >= 4:
+            recent_avg = sum(entropy_sequence[-4:]) / 4
+            budget = cfg.entropy_low + 0.75 * (cfg.entropy_high - cfg.entropy_low)
+            if recent_avg > budget:
                 return True
         
         return False
     
-    def compute_adaptive_k(self) -> int:
+    # ──────────────────────────────────────────────
+    #  ADAPTIVE K — COMPUTE NEXT K
+    # ──────────────────────────────────────────────
+    
+    def compute_adaptive_k(self):
         """
-        Compute the K for the next draft round based on recent history.
+        Compute next K with anti-collapse protections.
         
-        Uses exponential moving average of acceptance rates:
-        - High acceptance → increase K (we can draft more aggressively)
-        - Low acceptance → decrease K (verify sooner)
-        
-        Also factors in recent entropy trends.
+        Key mechanisms:
+        1. Warmup: hold at k_initial for first N rounds
+        2. Symmetric ±1 steps  
+        3. Recovery: if stuck at k_min for 5+ rounds, force bump to k_min+2
+        4. Acceptance threshold asymmetry: easy to increase, harder to decrease
         """
         cfg = self.config
         
-        if self.state.total_verification_rounds == 0:
+        # ── Warmup ──
+        if self.state.total_verification_rounds < self._warmup_rounds:
             return cfg.k_initial
         
-        # Get current acceptance EMA
         acc_rate = self.state.ema_acceptance_rate
+        current_k = self.state.current_k
         
-        # Decision logic
-        if acc_rate > cfg.acceptance_target + 0.1:
-            # Acceptance is great — be more aggressive
-            new_k = self.state.current_k + cfg.k_increase_step
-        elif acc_rate < cfg.acceptance_target - 0.1:
-            # Acceptance is poor — pull back
-            new_k = self.state.current_k - cfg.k_decrease_step
+        # ── Recovery from K floor ──
+        # If we've been stuck at k_min for too long, the only way to know
+        # if conditions improved is to TRY a higher K.
+        if current_k <= cfg.k_min and self.state.consecutive_at_k_min >= 5:
+            self.state.consecutive_at_k_min = 0
+            return cfg.k_min + 2  # Jump up to probe
+        
+        # ── Acceptance-based adjustment ──
+        # Bias toward increasing: lower bar to increase (+0.03), higher bar to decrease (-0.20)
+        if acc_rate > cfg.acceptance_target + 0.03:
+            new_k = current_k + 1
+        elif acc_rate < cfg.acceptance_target - 0.20:
+            new_k = current_k - 1
         else:
-            # In the sweet spot, keep current
-            new_k = self.state.current_k
+            new_k = current_k
         
-        # Also factor in recent entropy
-        if self.state.entropy_history:
-            recent_entropy = sum(self.state.entropy_history[-5:]) / min(5, len(self.state.entropy_history))
-            if recent_entropy < cfg.entropy_low:
-                new_k += 1  # Extra bonus for low-entropy contexts
-            elif recent_entropy > cfg.entropy_high:
-                new_k -= 1  # Extra penalty for high-entropy
+        # ── Entropy nudge (gentle, only at extremes) ──
+        if len(self.state.entropy_history) >= 5:
+            recent_ent = sum(self.state.entropy_history[-5:]) / 5
+            if recent_ent < cfg.entropy_low * 0.5:
+                new_k += 1  # Very confident → draft more
+            elif recent_ent > cfg.entropy_high * 0.9:
+                new_k -= 1  # Very confused → draft less
         
-        # Clamp
         new_k = max(cfg.k_min, min(cfg.k_max, new_k))
+        
+        # Track consecutive rounds at floor
+        if new_k <= cfg.k_min:
+            self.state.consecutive_at_k_min += 1
+        else:
+            self.state.consecutive_at_k_min = 0
         
         return new_k
     
     # ──────────────────────────────────────────────
-    #  EASD ENTROPY PENALTY (Verification Phase)
+    #  EASD ENTROPY PENALTY
     # ──────────────────────────────────────────────
     
-    def easd_should_reject(
-        self,
-        draft_logits: torch.Tensor,
-        target_logits: torch.Tensor,
-        temperature: float = 1.0
-    ) -> bool:
-        """
-        EASD-style entropy penalty during verification.
-        
-        When BOTH models have high entropy AND their top-N predictions 
-        substantially overlap, the token is rejected and resampled from 
-        the target. This prevents low-confidence errors from propagating.
-        
-        From arxiv 2512.23765:
-        "When both models exhibit high entropy with substantial overlap 
-        among their top-N predictions, the corresponding token is rejected 
-        and re-sampled by the target LLM."
-        """
+    def easd_should_reject(self, draft_logits, target_logits, temperature=1.0):
         if not self.config.easd_enabled:
             return False
-        
         cfg = self.config
-        
-        # Compute entropies for both models
-        draft_entropy = self.compute_entropy(draft_logits, temperature).item()
-        target_entropy = self.compute_entropy(target_logits, temperature).item()
-        
-        # Both must have high entropy
-        if draft_entropy < cfg.easd_entropy_threshold or target_entropy < cfg.easd_entropy_threshold:
+        d_h = self.compute_entropy(draft_logits, temperature).item()
+        t_h = self.compute_entropy(target_logits, temperature).item()
+        if d_h < cfg.easd_entropy_threshold or t_h < cfg.easd_entropy_threshold:
             return False
-        
-        # Check top-N overlap
-        overlap = self.compute_top_n_overlap(
-            draft_logits, target_logits, cfg.easd_top_n
-        )
-        
-        # High overlap under high uncertainty = reject
+        overlap = self.compute_top_n_overlap(draft_logits, target_logits, cfg.easd_top_n)
         return overlap >= cfg.easd_overlap_threshold
     
-    def js_should_reject(
-        self,
-        draft_logits: torch.Tensor,
-        target_logits: torch.Tensor,
-        temperature: float = 1.0
-    ) -> bool:
-        """
-        AdaSD-style JS divergence acceptance criterion.
-        
-        Accept if JSD(draft || target) < adaptive threshold.
-        Reject otherwise.
-        
-        The threshold is updated via EMA based on recent history.
-        """
+    def js_should_reject(self, draft_logits, target_logits, temperature=1.0):
         if not self.config.js_divergence_enabled:
             return False
-        
-        jsd = self.compute_js_divergence(
-            draft_logits, target_logits, temperature
-        ).item()
-        
+        jsd = self.compute_js_divergence(draft_logits, target_logits, temperature).item()
         return jsd > self.state.ema_js_threshold
     
     # ──────────────────────────────────────────────
     #  STATE UPDATES
     # ──────────────────────────────────────────────
     
-    def update_after_verification(
-        self,
-        n_drafted: int,
-        n_accepted: int,
-        draft_entropies: List[float],
-        js_divergences: Optional[List[float]] = None
-    ):
-        """
-        Update internal state after a verification round.
-        Called by the speculative engine after each draft-verify cycle.
-        """
+    def update_after_verification(self, n_drafted, n_accepted, draft_entropies, js_divergences=None):
         cfg = self.config
-        
-        # Update counters
         self.state.total_draft_tokens += n_drafted
         self.state.total_accepted_tokens += n_accepted
         self.state.total_verification_rounds += 1
         
-        # Acceptance rate for this round
         round_acceptance = n_accepted / max(n_drafted, 1)
         self.state.acceptance_history.append(round_acceptance)
         
-        # Update EMA acceptance rate
+        alpha = cfg.ema_alpha
         self.state.ema_acceptance_rate = (
-            cfg.ema_alpha * round_acceptance +
-            (1 - cfg.ema_alpha) * self.state.ema_acceptance_rate
+            alpha * round_acceptance + (1 - alpha) * self.state.ema_acceptance_rate
         )
         
-        # Update entropy EMA
         if draft_entropies:
-            avg_entropy = sum(draft_entropies) / len(draft_entropies)
-            self.state.ema_entropy = (
-                cfg.ema_alpha * avg_entropy +
-                (1 - cfg.ema_alpha) * self.state.ema_entropy
-            )
-            self.state.entropy_history.extend(draft_entropies)
+            valid = [e for e in draft_entropies if math.isfinite(e)]
+            if valid:
+                avg = sum(valid) / len(valid)
+                self.state.ema_entropy = alpha * avg + (1 - alpha) * self.state.ema_entropy
+                self.state.entropy_history.extend(valid)
         
-        # Update JS divergence threshold (AdaSD-style adaptive)
         if js_divergences and cfg.js_divergence_enabled:
-            avg_jsd = sum(js_divergences) / len(js_divergences)
-            self.state.ema_js_threshold = (
-                cfg.js_ema_alpha * avg_jsd +
-                (1 - cfg.js_ema_alpha) * self.state.ema_js_threshold
-            )
+            valid_js = [j for j in js_divergences if math.isfinite(j)]
+            if valid_js:
+                avg_jsd = sum(valid_js) / len(valid_js)
+                self.state.ema_js_threshold = (
+                    cfg.js_ema_alpha * avg_jsd + (1 - cfg.js_ema_alpha) * self.state.ema_js_threshold
+                )
         
-        # Compute new adaptive K
         new_k = self.compute_adaptive_k()
         self.state.k_history.append(new_k)
         self.state.current_k = new_k
     
-    def get_stats(self) -> dict:
-        """Return summary statistics."""
+    def get_stats(self):
         total = self.state.total_draft_tokens
         accepted = self.state.total_accepted_tokens
         return {
