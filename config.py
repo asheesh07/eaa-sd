@@ -12,7 +12,7 @@ import torch
 @dataclass
 class ModelConfig:
     """Model identifiers and loading settings."""
-    draft_model_name: str = "meta-llama/Llama-2-1.3B-chat-hf"
+    draft_model_name: str = "meta-llama/Llama-2-1.3B"
     target_model_name: str = "meta-llama/Llama-2-7b-chat-hf"
     
     # Device placement
