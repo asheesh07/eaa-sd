@@ -45,7 +45,7 @@ class DraftModel:
         
         # Load tokenizer (shared with target since both are Llama family)
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_config.draft_model_name,
+            self.model_config.target_model_name,
             trust_remote_code=True
         )
         if self.tokenizer.pad_token is None:
