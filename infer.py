@@ -115,7 +115,7 @@ class InferenceCLI:
         self.target = AutoModelForCausalLM.from_pretrained(
             target_model,
             quantization_config=target_quantize,
-            device_map=self.device,
+            device_map="auto",
             trust_remote_code=True,
         ).eval()
 
@@ -127,7 +127,7 @@ class InferenceCLI:
         self.drafter = AutoModelForCausalLM.from_pretrained(
             drafter_model,
             quantization_config=drafter_quantize,
-            device_map=self.device,
+            device_map="auto",
             trust_remote_code=True,
         ).eval()
 
