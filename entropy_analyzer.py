@@ -71,6 +71,12 @@ class EntropyAnalyzer:
     def compute_js_divergence(p_logits, q_logits, temperature=1.0):
         p_logits = p_logits.detach().float().clamp(-100, 100)
         q_logits = q_logits.detach().float().clamp(-100, 100)
+        # Align vocab sizes
+        pv, qv = p_logits.shape[-1], q_logits.shape[-1]
+        if pv < qv:
+            p_logits = F.pad(p_logits, (0, qv - pv), value=-1e9)
+        elif qv < pv:
+            q_logits = F.pad(q_logits, (0, pv - qv), value=-1e9)
         p_log = F.log_softmax(p_logits / max(temperature, 1e-8), dim=-1)
         q_log = F.log_softmax(q_logits / max(temperature, 1e-8), dim=-1)
         p, q = p_log.exp(), q_log.exp()

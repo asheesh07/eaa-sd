@@ -146,7 +146,9 @@ class SpeculativeEngine:
             [[last_token_id]], dtype=torch.long
         )
         _ = self.draft_model.generate_step(first_token_tensor)
-        _ = self.target_model.generate_step(first_token_tensor)
+        last_target_logits = self.target_model.generate_step(first_token_tensor)
+        # last_target_logits = P_target(next | prompt + first_token)
+        # This is the "pre-draft" logits for the first round
         
         # ── GENERATION STATE ──
         generated_tokens = [last_token_id]
@@ -168,16 +170,11 @@ class SpeculativeEngine:
             #  PHASE 1: DRAFT (generate K candidate tokens)
             # ═══════════════════════════════════════════
             
-            # Roll back draft model cache to after last confirmed token
-            # (It may have advanced during the previous draft round)
-            # Actually, after verification we handle this — see below
-            
             draft_seq = self.draft_loop.generate_draft(
                 last_token_id=last_token_id
             )
             
             if len(draft_seq.token_ids) == 0:
-                # Shouldn't happen, but safety check
                 break
             
             # ═══════════════════════════════════════════
@@ -187,7 +184,8 @@ class SpeculativeEngine:
             verification = self.target_model.verify_draft(
                 draft_token_ids=draft_seq.token_ids,
                 draft_logits=draft_seq.logits,
-                entropy_analyzer=self.entropy_analyzer
+                entropy_analyzer=self.entropy_analyzer,
+                pre_draft_logits=last_target_logits
             )
             
             # ═══════════════════════════════════════════
@@ -216,13 +214,14 @@ class SpeculativeEngine:
             if n_rejected > 0:
                 self.draft_model.rollback_cache(n_rejected)
             
-            # Feed the correction token into draft model cache
+            # Feed the correction/bonus token into both models' caches
+            # and capture the target logits for next round's pre_draft_logits
             if verification.correction_token is not None:
                 correction_tensor = torch.tensor(
                     [[verification.correction_token]], dtype=torch.long
                 )
                 _ = self.draft_model.generate_step(correction_tensor)
-                _ = self.target_model.generate_step(correction_tensor)
+                last_target_logits = self.target_model.generate_step(correction_tensor)
             
             # ═══════════════════════════════════════════
             #  PHASE 5: UPDATE ENTROPY ANALYZER

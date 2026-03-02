@@ -162,33 +162,34 @@ class TargetModel:
         self,
         draft_token_ids: List[int],
         draft_logits: List[torch.Tensor],
-        entropy_analyzer=None
+        entropy_analyzer=None,
+        pre_draft_logits: torch.Tensor = None
     ) -> VerificationResult:
         """
         Verify K draft tokens in a SINGLE forward pass.
         
-        This is the key efficiency trick: instead of running the target
-        model K times autoregressively, we feed all K tokens at once.
-        The target model produces logits for positions [0, 1, ..., K],
-        where position i gives us P_target(x_{i+1} | x_{<i}).
+        CRITICAL INDEXING:
+        After prefill + first_token, the target cache covers [prompt + first_token].
+        We feed [draft[0], ..., draft[K-1]] to the target model.
         
-        Acceptance criterion (speculative sampling):
-        For each draft token x_i sampled from P_draft:
-            Accept with probability min(1, P_target(x_i) / P_draft(x_i))
-            
-        On first rejection at position j:
-            Sample correction from: norm(max(0, P_target - P_draft))
-            
-        If all K tokens accepted:
-            Sample bonus token from P_target at position K+1
-            
+        Output logits[i] = P_target(next | cache + draft[0:i+1])
+        
+        To verify draft[0]: need P_target(next | cache) = pre_draft_logits
+        To verify draft[i]: need logits[i-1]  (i >= 1)
+        Bonus token: from logits[K-1]
+        
+        So the "verification logits" for position i are:
+            verify_logits[0] = pre_draft_logits
+            verify_logits[i] = target_logits_all[i-1]   for i >= 1
+            bonus_logits     = target_logits_all[K-1]
+        
         Args:
             draft_token_ids: K draft token IDs
-            draft_logits: K sets of draft logits (for acceptance ratio)
-            entropy_analyzer: Optional, for EASD penalty checks
-            
-        Returns:
-            VerificationResult
+            draft_logits: K sets of draft logits
+            entropy_analyzer: Optional, for EASD checks
+            pre_draft_logits: Target model logits from BEFORE the draft
+                              (i.e., P_target(next | prompt + last_confirmed_token))
+                              REQUIRED for correct verification of draft[0].
         """
         K = len(draft_token_ids)
         if K == 0:
@@ -199,148 +200,125 @@ class TargetModel:
                 js_divergences=[]
             )
         
-        # Build input: the K draft tokens
+        # ── Forward pass: feed all K draft tokens at once ──
         draft_tensor = torch.tensor(
             [draft_token_ids], dtype=torch.long, device=self.device
-        )  # [1, K]
+        )
         
-        # Single forward pass through target model
         outputs = self.model(
             input_ids=draft_tensor,
             past_key_values=self._past_key_values,
             use_cache=True
         )
         
-        # outputs.logits: [1, K, vocab_size]
-        # Position i gives P_target(x | context + draft[0:i])
+        # target_logits_all[i] = P_target(next | cache + draft[0:i+1])
         target_logits_all = outputs.logits.squeeze(0).float()  # [K, vocab_size]
-        
-        # We need K+1 logits positions:
-        # - Positions 0..K-1 verify draft tokens 0..K-1
-        # - Position K-1's logits give us the bonus/correction at position K
-        # But actually, position i's logits verify draft_token[i]:
-        #   - Logits at position 0 (after seeing draft[0]) verify draft[1]
-        #   - We need the logits BEFORE draft[0] for verifying draft[0]
-        # 
-        # Wait — let me be precise about the indexing:
-        # The target model's KV cache already has the prompt.
-        # We feed [draft[0], draft[1], ..., draft[K-1]].
-        # Output logits[i] = P_target(next | prompt + draft[0:i+1])
-        #
-        # To verify draft[0], we need P_target(x | prompt) — that's the 
-        # logits from prefill (position before draft[0]).
-        # To verify draft[i], we need logits[i-1].
-        # The bonus token comes from logits[K-1].
-        #
-        # So we need the "pre-draft" logits too. We get these from the
-        # speculative engine which stores the last target logits.
-        
-        # For now, we return all K logits and let the engine handle indexing
-        # The engine should prepend the pre-draft logits
-        
-        # Update KV cache
         new_past = outputs.past_key_values
+        target_vocab = target_logits_all.shape[-1]
         
-        # Compute JS divergences for each position
+        # ── Build verification logits array ──
+        # verify_logits[i] is used to verify draft_token_ids[i]
+        # verify_logits[0] = pre_draft_logits (from before any draft token)
+        # verify_logits[i] = target_logits_all[i-1] for i >= 1
+        
+        if pre_draft_logits is not None:
+            pre = pre_draft_logits.to(self.device).float().squeeze()
+            # Ensure pre_draft_logits matches target vocab size
+            if pre.shape[-1] < target_vocab:
+                pre = F.pad(pre, (0, target_vocab - pre.shape[-1]), value=-1e9)
+            elif pre.shape[-1] > target_vocab:
+                pre = pre[..., :target_vocab]
+            verify_logits = [pre] + [target_logits_all[i] for i in range(K - 1)]
+        else:
+            # Fallback: use target_logits_all[i] for verify (off-by-one but no choice)
+            verify_logits = [target_logits_all[i] for i in range(K)]
+        
+        # Bonus logits: always from last position
+        bonus_logits = target_logits_all[K - 1]
+        
+        # ── Helper: align vocab sizes ──
+        def align_to_target(draft_l):
+            """Pad or truncate draft logits to match target vocab size."""
+            draft_l = draft_l.to(self.device).float()
+            dv = draft_l.shape[-1]
+            if dv < target_vocab:
+                return F.pad(draft_l, (0, target_vocab - dv), value=-1e9)
+            elif dv > target_vocab:
+                return draft_l[..., :target_vocab]
+            return draft_l
+        
+        # ── Compute JS divergences ──
         js_divergences = []
+        temp = self.gen_config.temperature
         for i in range(K):
-            d_logits = draft_logits[i].to(self.device).float().clamp(-100, 100)
-            t_logits = target_logits_all[i].float().clamp(-100, 100)
-            
-            # Simplified JSD computation
-            p = F.softmax(d_logits / max(self.gen_config.temperature, 1e-8), dim=-1).clamp(min=1e-10)
-            q = F.softmax(t_logits / max(self.gen_config.temperature, 1e-8), dim=-1).clamp(min=1e-10)
+            d_l = align_to_target(draft_logits[i]).clamp(-100, 100)
+            t_l = verify_logits[i].clamp(-100, 100)
+            p = F.softmax(d_l / max(temp, 1e-8), dim=-1).clamp(min=1e-10)
+            q = F.softmax(t_l / max(temp, 1e-8), dim=-1).clamp(min=1e-10)
             m = (0.5 * (p + q)).clamp(min=1e-10)
             jsd = 0.5 * (F.kl_div(m.log(), p, reduction='sum', log_target=False) +
                          F.kl_div(m.log(), q, reduction='sum', log_target=False))
-            jsd_val = jsd.item() if torch.isfinite(jsd) else 0.0
-            js_divergences.append(max(0.0, jsd_val))
+            js_divergences.append(max(0.0, jsd.item()) if torch.isfinite(jsd) else 0.0)
         
-        # Now do the speculative sampling acceptance/rejection
+        # ── Speculative sampling: accept/reject ──
         accepted_tokens = []
         n_accepted = 0
         correction_token = None
-        temp = self.gen_config.temperature
+        n_to_rollback = 0
         
         for i in range(K):
-            # For position i:
-            # - draft_logits[i] was used to sample draft_token_ids[i]
-            # - target logits for verifying position i:
-            #   Position 0: need pre-draft logits (handled by engine)
-            #   Position i>0: target_logits_all[i-1]
-            # This is handled by the engine passing pre_logits separately.
-            # Here we process using the logits the engine has assembled.
-            
-            d_logits = draft_logits[i].to(self.device).float()
-            
-            # We verify draft[i] using target logits at position i
-            # (the engine will assemble these correctly)
-            t_logits = target_logits_all[min(i, K-1)].float()
-            
+            d_l = align_to_target(draft_logits[i])
+            t_l = verify_logits[i]
             draft_token = draft_token_ids[i]
             
-            # Compute acceptance probability
-            p_draft = F.softmax(d_logits / max(temp, 1e-8), dim=-1).clamp(min=1e-10)
-            p_target = F.softmax(t_logits / max(temp, 1e-8), dim=-1).clamp(min=1e-10)
+            p_draft = F.softmax(d_l / max(temp, 1e-8), dim=-1).clamp(min=1e-10)
+            p_target = F.softmax(t_l / max(temp, 1e-8), dim=-1).clamp(min=1e-10)
             
-            # Speculative sampling criterion
+            # Acceptance probability: min(1, P_target(x) / P_draft(x))
+            # draft_token is always within draft vocab, so index is valid for both
+            # (target has >= draft vocab size after padding)
             acceptance_prob = torch.clamp(
                 p_target[draft_token] / (p_draft[draft_token] + 1e-10),
                 max=1.0
             ).item()
             
-            # EASD entropy penalty check
+            # EASD check
             easd_reject = False
             if entropy_analyzer is not None:
                 easd_reject = entropy_analyzer.easd_should_reject(
-                    d_logits.unsqueeze(0), t_logits.unsqueeze(0), temp
+                    d_l.unsqueeze(0), t_l.unsqueeze(0), temp
                 )
             
-            # Accept or reject
             r = torch.rand(1).item()
             
             if r < acceptance_prob and not easd_reject:
-                # Accept
                 accepted_tokens.append(draft_token)
                 n_accepted += 1
             else:
-                # Reject — sample correction from residual distribution
-                # P_corrected = norm(max(0, P_target - P_draft))
+                # Correction from residual: norm(max(0, P_target - P_draft))
                 residual = torch.clamp(p_target - p_draft, min=0.0)
                 residual_sum = residual.sum()
-                
                 if residual_sum > 1e-8:
-                    residual = residual / residual_sum
-                    correction_token = torch.multinomial(residual, 1).item()
+                    correction_token = torch.multinomial(residual / residual_sum, 1).item()
                 else:
-                    # Fallback: sample from target distribution
                     correction_token = torch.multinomial(p_target, 1).item()
                 
-                # Rollback: we accepted i tokens, rejected from position i onward
-                # The KV cache should reflect only accepted tokens
                 n_to_rollback = K - i
                 break
         else:
-            # All K tokens accepted — sample bonus token from last position
-            last_logits = target_logits_all[-1]
-            p_bonus = F.softmax(last_logits / max(temp, 1e-8), dim=-1)
-            
+            # All K accepted — bonus token from last target logits
+            p_bonus = F.softmax(bonus_logits / max(temp, 1e-8), dim=-1)
             if self.gen_config.do_sample:
                 correction_token = torch.multinomial(p_bonus, 1).item()
             else:
-                correction_token = last_logits.argmax().item()
-            
+                correction_token = bonus_logits.argmax().item()
             n_to_rollback = 0
         
-        # Fix the KV cache: keep only the accepted portion + correction
+        # ── Fix KV cache ──
         if n_to_rollback > 0:
-            # We need to rollback to after the last accepted token
-            # The new past_key_values should cover: prompt + accepted_tokens
             self._past_key_values = new_past
             self.rollback_cache(n_to_rollback)
-            self._cache_seq_len = self._cache_seq_len  # Already updated by rollback
         else:
-            # All accepted — cache is correct as-is
             self._past_key_values = new_past
             self._cache_seq_len += K
         
